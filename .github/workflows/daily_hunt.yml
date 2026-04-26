@@ -20,7 +20,9 @@ jobs:
           python-version: "3.10"
 
       - name: Install Poetry
-        run: pipx install poetry
+        run: |
+          pip install pipx
+          pipx install poetry==1.8.3
 
       - name: Cache Poetry Dependencies
         uses: actions/cache@v3
@@ -31,7 +33,7 @@ jobs:
       - name: Install Dependencies
         run: poetry install --no-interaction --no-root
 
-      - name: Execute Search
+      - name: Run Job Hunter
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
