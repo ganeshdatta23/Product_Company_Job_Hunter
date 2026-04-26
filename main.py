@@ -1,211 +1,314 @@
 import asyncio
+import json
 import logging
 import os
+import re
 import smtplib
+from urllib.parse import urlparse
+from typing import List
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from smtplib import SMTPAuthenticationError
-from typing import Any, Dict
 
 import PyPDF2
+import requests
 from google.adk.agents import Agent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.adk.tools import google_search
 from google.genai.types import Content, Part
-from pydantic import EmailStr, Field, SecretStr
+from pydantic import BaseModel, EmailStr, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 class Settings(BaseSettings):
-    gemini_api_key: SecretStr = Field(...)
-    sender_email: EmailStr = Field(...)
-    email_app_password: SecretStr = Field(...)
-    resume_path: str = Field("my_resume.pdf")
-    notice_period_days: int = Field(90)
-    min_experience_years: int = Field(0)
-    max_experience_years: int = Field(2)
-    max_jobs_to_send: int = Field(5)
-
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )
 
+    gemini_api_key: SecretStr = Field(..., validation_alias="GEMINI_API_KEY")
+    sender_email: EmailStr = Field(..., validation_alias="SENDER_EMAIL")
+    email_app_password: SecretStr = Field(..., validation_alias="EMAIL_APP_PASSWORD")
+
+    resume_path: str = "my_resume.pdf"
+    max_jobs: int = 5
+    min_confidence: int = 70
 
 config = Settings()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-def normalize_gmail_app_password(password: str) -> str:
-    return "".join(password.strip().strip("'\"").split())
+logging.basicConfig(level=logging.INFO)
 
 
-def validate_email_settings() -> bool:
-    normalized_password = normalize_gmail_app_password(
-        config.email_app_password.get_secret_value()
-    )
-    if len(normalized_password) != 16:
-        logging.error(
-            "EMAIL_APP_PASSWORD must be a 16-character Gmail App Password after removing spaces. "
-            "Current normalized length: %s. Generate a new one from Google Account -> Security -> "
-            "2-Step Verification -> App Passwords.",
-            len(normalized_password),
-        )
-        return False
-    return True
+class Job(BaseModel):
+    company: str
+    title: str
+    location: str
+    apply_url: str
+    why_match: str
+    confidence: int
+
+class JobReport(BaseModel):
+    candidate_summary: str
+    jobs: List[Job]
 
 
-def extract_resume_data(file_path: str = config.resume_path) -> str:
-    logging.info("Reading resume...")
-    if not os.path.exists(file_path):
-        return f"Error: Resume not found at '{file_path}'."
-
+def extract_resume():
     text = ""
-    try:
-        with open(file_path, "rb") as file:
-            for page in PyPDF2.PdfReader(file).pages:
-                text += page.extract_text() or ""
-        return f"Resume Content: {text[:7000]}"
-    except Exception as e:
-        return f"System Error: {str(e)}"
+    with open(config.resume_path, "rb") as f:
+        reader = PyPDF2.PdfReader(f)
+        for page in reader.pages:
+            text += page.extract_text() or ""
+    return text[:8000]
 
 
-def dispatch_email_report(html_job_report: str) -> Dict[str, Any]:
-    logging.info("Formatting and sending email...")
-    sender = config.sender_email
-    sender_id = str(config.sender_email)
-    password = normalize_gmail_app_password(config.email_app_password.get_secret_value())
+def is_direct_job_url(url: str) -> tuple[bool, str]:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False, "invalid-url-format"
 
-    if "```html" in html_job_report:
-        html_job_report = html_job_report.split("```html")[1].split("```")[0].strip()
+    query = parsed.query.lower()
+    path = parsed.path.lower()
+    netloc = parsed.netloc.lower()
+    url_lower = url.lower()
 
-    msg = MIMEMultipart()
-    msg["From"] = msg["To"] = sender
-    msg["Subject"] = f"Daily Product-Based Job Matches ({config.notice_period_days}-Day Notice)"
-    msg.attach(MIMEText(html_job_report, "html"))
+    if any(token in query for token in ("q=", "query=", "keyword=", "keywords=", "search=")):
+        return False, "search-results-url"
 
-    try:
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-            server.login(sender_id, password)
-            server.send_message(msg)
-        logging.info("Email successfully delivered.")
-        return {"status": "success", "message": "Email delivered."}
-    except SMTPAuthenticationError as e:
-        logging.error(
-            "Email login failed for '%s'. Gmail requires the account email plus a valid App Password "
-            "(not the normal Gmail password). Original error: %s",
-            sender_id,
-            e,
+    if any(marker in url_lower for marker in ("/jobs?", "/search", "/results", "/find-jobs")):
+        return False, "listing-page-url"
+
+    if "indeed." in netloc and "/viewjob" not in path:
+        return False, "indeed-non-direct-url"
+
+    return True, "direct-url-shape"
+
+
+def is_trusted_job_host(url: str) -> bool:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+
+    trusted_patterns = (
+        ("wellfound.com", "/jobs/"),
+        ("boards.greenhouse.io", "/"),
+        ("job-boards.greenhouse.io", "/"),
+        ("lever.co", "/"),
+        ("jobs.lever.co", "/"),
+        ("myworkdayjobs.com", "/"),
+        ("workdayjobs.com", "/"),
+        ("smartrecruiters.com", "/job/"),
+        ("ashbyhq.com", "/job/"),
+    )
+
+    return any(domain in host and path_prefix in path for domain, path_prefix in trusted_patterns)
+
+
+def validate_url(url: str) -> tuple[bool, str]:
+    is_direct, direct_reason = is_direct_job_url(url)
+    if not is_direct:
+        return False, direct_reason
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/135.0.0.0 Safari/537.36"
         )
-        return {
-            "status": "error",
-            "message": "Gmail authentication failed. Check SENDER_EMAIL/SENDER_ID and EMAIL_APP_PASSWORD.",
-        }
-    except Exception as e:
-        logging.error("Email failed: %s", e)
-        return {"status": "error", "message": str(e)}
+    }
+
+    try:
+        res = requests.head(url, timeout=10, allow_redirects=True, headers=headers)
+        if res.status_code < 400:
+            return True, f"head-{res.status_code}"
+        if res.status_code in {403, 429} and is_trusted_job_host(url):
+            return True, f"trusted-host-head-{res.status_code}"
+        if res.status_code not in {403, 405, 406, 429}:
+            return False, f"head-{res.status_code}"
+    except requests.RequestException as exc:
+        logging.info("HEAD check failed for %s: %s", url, exc)
+
+    try:
+        res = requests.get(url, timeout=10, allow_redirects=True, headers=headers, stream=True)
+        if res.status_code < 400:
+            return True, f"get-{res.status_code}"
+        if res.status_code in {403, 429} and is_trusted_job_host(url):
+            return True, f"trusted-host-get-{res.status_code}"
+        return False, f"get-{res.status_code}"
+    except requests.RequestException as exc:
+        return False, f"request-error-{exc.__class__.__name__}"
 
 
-def build_agent() -> Agent:
+def extract_json(text: str):
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    return match.group(0) if match else text
+
+def build_agent():
     os.environ["GEMINI_API_KEY"] = config.gemini_api_key.get_secret_value()
+
     return Agent(
-        name="Auto_Job_Hunter",
+        name="JobHunter",
         model="gemini-2.5-flash",
         instruction=f"""
-        You are an elite AI recruiter helping the user transition to start-ups or product-based companies.
+You are a STRICT job matching system.
 
-        Your goal is to find only accurate, relevant, genuine software roles for this specific candidate.
+CRITICAL RULES:
+- ONLY return jobs found via search tool
+- NEVER guess or invent jobs
+- EVERY job MUST have a direct apply URL to the specific job post
+- If unsure, do not include
+- Prefer fewer accurate jobs over many
+- NEVER return search results pages, listing pages, or generic job board query URLs
+- DO NOT return URLs like indeed.com/jobs?... , company homepages, or careers homepages
+- If you cannot find the exact job-post URL, omit the job
 
-        Follow this process:
-        1. Read the resume carefully and infer the candidate profile:
-           - core languages, frameworks, databases, cloud/tools, internships/projects
-           - likely target roles based on the actual resume
-           - seniority fit for an early-career candidate
-        2. Search only for recent openings that fit this candidate and are suitable for
-           {config.min_experience_years}-{config.max_experience_years} years of experience.
-        3. Prioritize start-ups ,product-based companies and genuine roles from:
-           - official company careers pages
-           - well-known trusted job boards when the listing is clearly tied to a real company
-        4. Verify each role before including it:
-           - the role must still appear open/live
-           - the company must be identifiable
-           - the apply URL must be direct and usable
-           - the role should clearly fit an early-career profile
-           - reject vague, duplicate, suspicious, staffing-only, or clearly outdated posts
-        5. Prefer roles that align strongly with the resume's actual skills and projects.
-        6. Keep search queries specific. Include terms like:
-           - software engineer OR backend engineer OR full stack engineer OR associate software engineer
-           - {config.min_experience_years}-{config.max_experience_years} years
-           - fresher OR entry level OR early career when useful
-           - "{config.notice_period_days} days notice period" OR "3 months notice period" when useful
+SOURCE PRIORITY:
+1. Official company careers
+2. ATS (Greenhouse, Lever, Workday)
+3. Trusted job boards ONLY if legit
 
-        Output requirements:
-        - Return ONLY raw HTML. No markdown.
-        - Include up to {config.max_jobs_to_send} roles, sorted by best match first.
-        - If fewer than {config.max_jobs_to_send} trustworthy matches are found, return fewer roles instead of guessing.
-        - For each role include:
-          Company, Title, Location, Experience Range, Why It Matches The Resume, Verification Note, Apply URL
-        - Add a short candidate summary at the top based on the resume.
-        - In the verification note, briefly state why you believe the role is genuine
-          such as official careers page, recognizable company listing, or live direct application page.
-        """,
-        tools=[google_search],
+FILTER:
+- Entry level (0-2 years)
+- Software / Backend / Full Stack roles only
+- Reject outdated or vague jobs
+
+OUTPUT FORMAT (JSON ONLY):
+{{
+  "candidate_summary": "...",
+  "jobs": [
+    {{
+      "company": "...",
+      "title": "...",
+      "location": "...",
+      "apply_url": "...",
+      "why_match": "...",
+      "confidence": 0-100
+    }}
+  ]
+}}
+
+RETURN MAX {config.max_jobs} JOBS
+CONFIDENCE MUST BE >= 70
+"""
+        ,
+        tools=[google_search]
     )
 
+def send_email(html):
+    msg = MIMEMultipart()
+    msg["From"] = str(config.sender_email)
+    msg["To"] = str(config.sender_email)
+    msg["Subject"] = "Daily Job Matches"
 
-async def execute_daily_hunt():
-    if not validate_email_settings():
-        return
+    msg.attach(MIMEText(html, "html"))
 
-    resume_text = extract_resume_data()
-    if "Error" in resume_text:
-        logging.error(resume_text)
-        return
+    with smtplib.SMTP("smtp.gmail.com", 587) as server:
+        server.starttls()
+        server.login(
+            str(config.sender_email),
+            config.email_app_password.get_secret_value()
+        )
+        server.send_message(msg)
+
+
+def render_html(report: JobReport):
+    html = f"<h2>Job Matches</h2><p>{report.candidate_summary}</p>"
+
+    for job in report.jobs:
+        html += f"""
+        <div style='border:1px solid #ccc;padding:10px;margin:10px'>
+            <h3>{job.title}</h3>
+            <p><b>{job.company}</b> - {job.location}</p>
+            <p>{job.why_match}</p>
+            <p>Confidence: {job.confidence}</p>
+            <a href="{job.apply_url}">Apply</a>
+        </div>
+        """
+
+    return html
+
+async def main():
+    resume = extract_resume()
 
     agent = build_agent()
     session_service = InMemorySessionService()
-    session = await session_service.create_session(app_name=agent.name, user_id="admin")
-    runner = Runner(agent=agent, session_service=session_service, app_name=agent.name)
+    session = await session_service.create_session(app_name="JobHunter", user_id="u1")
 
-    prompt = (
-        f"""Here is my resume data:
+    runner = Runner(agent=agent, session_service=session_service, app_name="JobHunter")
 
-        {resume_text}
+    prompt = f"""
+Analyze this resume and find matching jobs:
 
-        Run the daily job hunt with these constraints:
-        - Target only roles relevant to my actual resume and skills.
-        - Focus on {config.min_experience_years}-{config.max_experience_years} years of experience.
-        - Prioritize software engineer, backend engineer, full stack engineer, and related entry-level start-up or product-company roles.
-        - My notice period is {config.notice_period_days} days.
-        - Prefer genuine, live openings that you can verify from trustworthy sources.
-        - Do not include doubtful or weakly related jobs just to fill the list.
-        """
-    )
+{resume}
 
-    final_html_response = ""
-    logging.info("Agent is searching the web for matching jobs...")
+STRICT:
+- Only real jobs
+- Use search tool
+- No guessing
+"""
+
+    response_text = ""
+
+    async for event in runner.run_async(
+        user_id="u1",
+        session_id=session.id,
+        new_message=Content(parts=[Part.from_text(text=prompt)], role="user"),
+    ):
+        if event.is_final_response():
+            response_text = event.content.parts[0].text
 
     try:
-        async for event in runner.run_async(
-            user_id="admin",
-            session_id=session.id,
-            new_message=Content(parts=[Part.from_text(text=prompt)], role="user"),
-        ):
-            if event.is_final_response():
-                final_html_response = event.content.parts[0].text
+        data = json.loads(extract_json(response_text))
+        report = JobReport(**data)
     except Exception as e:
-        logging.error("Agent Search Failure: %s", e)
+        logging.error("Parsing failed: %s", e)
         return
 
-    if final_html_response:
-        dispatch_email_report(final_html_response)
-    else:
-        logging.warning("Agent returned an empty response. No email sent.")
+    logging.info("Model returned %s jobs before filtering", len(report.jobs))
+
+    filtered_jobs = []
+    for job in report.jobs:
+        if job.confidence < config.min_confidence:
+            logging.info(
+                "Rejected job '%s' at %s: confidence %s < %s",
+                job.title,
+                job.company,
+                job.confidence,
+                config.min_confidence,
+            )
+            continue
+
+        url_ok, url_reason = validate_url(job.apply_url)
+        if not url_ok:
+            logging.info(
+                "Rejected job '%s' at %s: URL validation failed (%s) for %s",
+                job.title,
+                job.company,
+                url_reason,
+                job.apply_url,
+            )
+            continue
+
+        logging.info(
+            "Accepted job '%s' at %s: confidence=%s, url_check=%s",
+            job.title,
+            job.company,
+            job.confidence,
+            url_reason,
+        )
+        filtered_jobs.append(job)
+
+    report.jobs = filtered_jobs[:config.max_jobs]
+    logging.info("Accepted %s jobs after filtering", len(report.jobs))
+
+    if not report.jobs:
+        logging.info("Raw model response: %s", response_text)
+        logging.warning("No valid jobs found")
+        return
+
+    html = render_html(report)
+    logging.info("Sending email with %s jobs", len(report.jobs))
+    send_email(html)
 
 
 if __name__ == "__main__":
-    asyncio.run(execute_daily_hunt())
+    asyncio.run(main())
